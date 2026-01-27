@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from agentscope.agent import ReActAgent
 from agentscope._logging import logger
 from agentscope.formatter import FormatterBase
-from agentscope.memory import MemoryBase
+from agentscope.memory import MemoryBase, InMemoryMemory
 from agentscope.message import (
     Msg,
     ToolUseBlock,
@@ -131,7 +131,7 @@ class BrowserAgent(ReActAgent):
         self.finish_function_name = "browser_generate_final_response"
         self.init_query = ""
         self._required_structured_model: Type[BaseModel] | None = None
-
+        
         super().__init__(
             name=name,
             sys_prompt=sys_prompt,
@@ -141,6 +141,8 @@ class BrowserAgent(ReActAgent):
             toolkit=toolkit,
             max_iters=max_iters,
         )
+
+        self._reasoning_hint_msgs = InMemoryMemory()
 
         # Register tools
         self.toolkit.register_tool_function(self.browser_subtask_manager)
@@ -355,8 +357,9 @@ class BrowserAgent(ReActAgent):
         self.previous_chunkwise_information = ""
         self.snapshot_in_chunk = []
 
-        mem_len = await self.memory.size()
-        await self.memory.delete(mem_len - 1)
+        memory_msgs = await self.memory.get_memory()
+        if len(memory_msgs) > 0:
+            await self.memory.delete([memory_msgs[-1].id])
 
         self.snapshot_in_chunk = await self._get_snapshot_in_text()
         for _ in self.snapshot_in_chunk:
