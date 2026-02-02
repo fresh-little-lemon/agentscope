@@ -149,3 +149,4 @@ package-lock.json
 .wireit/
 .angular/
 *.ts
+examples/agent/browser_agent/session_logs/

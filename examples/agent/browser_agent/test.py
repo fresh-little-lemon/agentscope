@@ -8,6 +8,8 @@ import argparse
 import traceback
 import json
 import time
+import subprocess
+import shutil
 from datetime import datetime
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -64,13 +66,20 @@ async def main(
     start_url_param: str = "https://www.google.com",
     max_iters_param: int = 50,
     headless: bool = False,
+    record_video: bool = False,
 ) -> None:
     """The main entry point for the browser agent example."""
     # Setup toolkit with browser tools from MCP server
     toolkit = Toolkit()
     
+    # Session logging setup
+    session_logs_dir = Path("session_logs")
+    session_logs_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     # Configure browser client arguments
-    client_args = ["@playwright/mcp@latest"]
+    # Set default viewport to 1280x720 to ensure consistent "fullscreen" experience
+    client_args = ["@playwright/mcp@latest", "--viewport-size=1280x720", "--isolated"]
     
     # Prepare environment variables
     env = os.environ.copy()
@@ -85,6 +94,14 @@ async def main(
         # Safest is to remove it if present.
         if "PLAYWRIGHT_MCP_HEADLESS" in env:
             del env["PLAYWRIGHT_MCP_HEADLESS"]
+
+    if record_video:
+        session_video_dir = session_logs_dir / f".video_tmp_{timestamp}"
+        session_video_dir.mkdir(exist_ok=True)
+        client_args.append("--save-video=1280x720")
+        client_args.append(f"--output-dir={session_video_dir.absolute()}")
+    else:
+        session_video_dir = None
         
     browser_client = StdIOStatefulClient(
         name="playwright-mcp",
@@ -92,10 +109,6 @@ async def main(
         args=client_args,
         env=env,
     )
-    
-    # Session logging setup
-    session_logs_dir = Path("session_logs")
-    session_logs_dir.mkdir(exist_ok=True)
     
     # Use LoggingMemory instead of list
     memory = LoggingMemory()
@@ -145,11 +158,36 @@ async def main(
     finally:
         # Save session history from memory
         if hasattr(memory, "history_log") and memory.history_log:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_file = session_logs_dir / f"session_{timestamp}.json"
+            
+            # Find video file if recording was enabled to include in metadata
+            video_meta = {}
+            if record_video and session_video_dir and session_video_dir.exists():
+                webm_files = list(session_video_dir.glob("**/*.webm"))
+                if webm_files:
+                    latest_video = max(webm_files, key=os.path.getmtime)
+                    video_meta = {
+                        "original_video": str(latest_video.name),
+                        "format": "webm",
+                        "status": "recording_captured"
+                    }
+
+            # Prepare full log structure
+            log_data = {
+                "session_id": timestamp,
+                "metadata": {
+                    "start_url": start_url_param,
+                    "max_iters": max_iters_param,
+                    "headless": headless,
+                    "record_video": record_video,
+                    "video_info": video_meta
+                },
+                "history": memory.history_log
+            }
+
             try:
                 with open(log_file, "w", encoding="utf-8") as f:
-                    json.dump(memory.history_log, f, indent=2, ensure_ascii=False)
+                    json.dump(log_data, f, indent=2, ensure_ascii=False)
                 print(f"\nSession log saved to: {log_file}")
             except Exception as log_error:
                 print(f"Error saving session log: {log_error}")
@@ -157,8 +195,55 @@ async def main(
         # Ensure browser client is always closed,
         # regardless of success or failure
         try:
+            # Explicitly call browser_close tool to release resources before process exit
+            if browser_client is not None:
+                try:
+                    print("Requesting browser to close...")
+                    await browser_client.call_tool("browser_close", {})
+                except Exception as close_tool_err:
+                    # Tool might not be available or connection already lost
+                    pass
+
             await browser_client.close()
             print("Browser client closed successfully.")
+            
+            # Post-process video if recording was enabled
+            if record_video and session_video_dir and session_video_dir.exists():
+                # Give filesystem a moment to sync
+                time.sleep(1)
+                
+                try:
+                    # Look ONLY in the session-specific directory
+                    webm_files = list(session_video_dir.glob("**/*.webm"))
+                    if webm_files:
+                        latest_video = max(webm_files, key=os.path.getmtime)
+                        
+                        # Use same timestamp as session log
+                        mp4_output = session_logs_dir / f"session_{timestamp}.mp4"
+                        
+                        # Convert to MP4
+                        if shutil.which("ffmpeg"):
+                            print(f"Converting video to MP4: {mp4_output}...")
+                            subprocess.run([
+                                "ffmpeg", "-y", "-i", str(latest_video),
+                                "-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p",
+                                "-loglevel", "error",
+                                str(mp4_output)
+                            ], check=True)
+                            print(f"Video saved to: {mp4_output}")
+                            
+                            # Clean up the session-specific temp directory
+                            shutil.rmtree(session_video_dir)
+                        else:
+                            print("ffmpeg not found! Keeping original webm video.")
+                            # Move webm to logs dir with correct name if no ffmpeg
+                            shutil.move(str(latest_video), str(session_logs_dir / f"session_{timestamp}.webm"))
+                            shutil.rmtree(session_video_dir)
+                    else:
+                        print(f"No video recording found in {session_video_dir}")
+                except Exception as video_error:
+                    print(f"Error compiling video: {video_error}")
+                        
         except Exception as cleanup_error:
             print(f"Error while closing browser client: {cleanup_error}")
 
@@ -188,6 +273,11 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Run browser in headless mode (default: False, i.e., headed)",
     )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Record session video (saved to session_logs/)",
+    )
     return parser.parse_args()
 
 
@@ -203,6 +293,7 @@ if __name__ == "__main__":
     print("  python main.py                           # Start with defaults")
     print("  python main.py --start-url https://example.com --max-iters 100")
     print("  python main.py --headless               # Run in headless mode")
+    print("  python main.py --record                 # Record session video")
     print("  python main.py --help                   # Show all options")
     print()
 
@@ -213,6 +304,7 @@ if __name__ == "__main__":
     start_url = args.start_url
     max_iters = args.max_iters
     is_headless = args.headless
+    is_record = args.record
 
     # Validate parameters
     if max_iters <= 0:
@@ -226,5 +318,6 @@ if __name__ == "__main__":
     print(f"Starting URL: {start_url}")
     print(f"Maximum iterations: {max_iters}")
     print(f"Headless mode: {is_headless}")
+    print(f"Record video: {is_record}")
 
-    asyncio.run(main(start_url, max_iters, is_headless))
+    asyncio.run(main(start_url, max_iters, is_headless, is_record))
